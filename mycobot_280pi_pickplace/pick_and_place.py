@@ -5,15 +5,16 @@ from rclpy.node import Node
 from rclpy.action import ActionClient
 from geometry_msgs.msg import Pose, Point, Quaternion
 from moveit_msgs.action import MoveGroup
+from shape_msgs.msg import SolidPrimitive
+from std_msgs.msg import Header
+import time
 from moveit_msgs.msg import (
     Constraints,
     PositionConstraint,
     OrientationConstraint,
     BoundingVolume,
+    JointConstraint,
 )
-from shape_msgs.msg import SolidPrimitive
-from std_msgs.msg import Header
-import time
 
 
 class PickAndPlaceNode(Node):
@@ -22,43 +23,49 @@ class PickAndPlaceNode(Node):
         super().__init__('pick_and_place_node')
         self.get_logger().info('Pick and Place Node has been started.')
 
-        self._action_client = ActionClient(self, MoveGroup, '/move_group')
+        self._action_client = ActionClient(self, MoveGroup, '/move_action')
 
-        self.down_orientation = Quaternion(x=1.0, y=0.0, z=0.0, w=0.0)
-
-        self.poses = {
-            'pre_grasp': Pose(
-                position=Point(x=0.10, y=0.00, z=0.15),
-                orientation=self.down_orientation
-            ),
-            'grasp': Pose(
-                position=Point(x=0.10, y=0.00, z=0.05),
-                orientation=self.down_orientation
-            ),
-            'lift': Pose(
-                position=Point(x=0.10, y=0.00, z=0.20),
-                orientation=self.down_orientation
-            ),
-            'pre_place': Pose(
-                position=Point(x=0.15, y=0.05, z=0.15),
-                orientation=self.down_orientation
-            ),
-            'place': Pose(
-                position=Point(x=0.15, y=0.05, z=0.05),
-                orientation=self.down_orientation
-            ),
+        # All poses defined as joint angles in radians
+        # [joint2_to_joint1, joint3_to_joint2, joint4_to_joint3,
+        #  joint5_to_joint4, joint6_to_joint5, joint6output_to_joint6]
+        self.joint_poses = {
+            'home':      [0.0,   0.0,   0.0,   0.0,   0.0,  0.0],
+            'pre_grasp': [1.431, 0.0,   0.0,   0.0,   0.0,  0.0],
+            'grasp':     [1.431, 0.0,   0.436, 0.0,   0.0,  0.0],
+            'lift':      [1.431, 0.0,   0.0,   0.0,   1.623, 0.0],
+            'pre_place': [1.431, 0.0,   0.0,   0.0,  -1.100, 0.0],
+            'place':     [-0.925, 0.0,  0.0,   0.0,   0.0,  0.0],
         }
 
-        self.get_logger().info('Waiting for MoveGroup action server...')
-        self._action_client.wait_for_server()
-        self.get_logger().info('MoveGroup ready. Starting sequence...')
+        self.joint_names = [
+            'joint2_to_joint1',
+            'joint3_to_joint2',
+            'joint4_to_joint3',
+            'joint5_to_joint4',
+            'joint6_to_joint5',
+            'joint6output_to_joint6',
+        ]
 
-    def move_to_pose(self, pose: Pose, description: str) -> bool:
+        self.get_logger().info('Waiting for MoveGroup action server...')
+        server_ready = self._action_client.wait_for_server(timeout_sec=10.0)
+        if not server_ready:
+            self.get_logger().error('MoveGroup action server not available!')
+        else:
+            self.get_logger().info('MoveGroup ready.')
+    def move_to_joint_target(self, pose_name: str) -> bool:
+        """
+        Move to a pose defined by joint angles.
+        Joint space planning is more reliable than Cartesian IK
+        for hardcoded pick and place sequences.
+        """
+        if pose_name not in self.joint_poses:
+            self.get_logger().error(f'Unknown pose: {pose_name}')
+            return False
+
+        positions = self.joint_poses[pose_name]
         self.get_logger().info(
-            f'Moving to [{description}]: '
-            f'x={pose.position.x:.3f} '
-            f'y={pose.position.y:.3f} '
-            f'z={pose.position.z:.3f}'
+            f'Moving to [{pose_name}]: '
+            f'{[round(p, 3) for p in positions]}'
         )
 
         goal_msg = MoveGroup.Goal()
@@ -68,38 +75,52 @@ class PickAndPlaceNode(Node):
         goal_msg.request.max_velocity_scaling_factor = 0.2
         goal_msg.request.max_acceleration_scaling_factor = 0.2
 
-        pos_constraint = PositionConstraint()
-        pos_constraint.header = Header(frame_id='base_link')
-        pos_constraint.link_name = 'link6_flange'
-        pos_constraint.weight = 1.0
-
-        tolerance = SolidPrimitive()
-        tolerance.type = SolidPrimitive.BOX
-        tolerance.dimensions = [0.01, 0.01, 0.01]
-
-        bounding_volume = BoundingVolume()
-        bounding_volume.primitives = [tolerance]
-        bounding_volume.primitive_poses = [pose]
-        pos_constraint.constraint_region = bounding_volume  # fixed
-
-        ori_constraint = OrientationConstraint()
-        ori_constraint.header = Header(frame_id='base_link')
-        ori_constraint.link_name = 'link6_flange'
-        ori_constraint.orientation = pose.orientation
-        ori_constraint.absolute_x_axis_tolerance = 0.2
-        ori_constraint.absolute_y_axis_tolerance = 0.2
-        ori_constraint.absolute_z_axis_tolerance = 0.2
-        ori_constraint.weight = 1.0
+        joint_constraints = []
+        for joint_name, position in zip(self.joint_names, positions):
+            jc = JointConstraint()
+            jc.joint_name = joint_name
+            jc.position = position
+            jc.tolerance_above = 0.01
+            jc.tolerance_below = 0.01
+            jc.weight = 1.0
+            joint_constraints.append(jc)
 
         constraints = Constraints()
-        constraints.position_constraints = [pos_constraint]
-        constraints.orientation_constraints = [ori_constraint]
+        constraints.joint_constraints = joint_constraints
         goal_msg.request.goal_constraints = [constraints]
 
         return self._send_goal_and_wait(goal_msg)
 
     def move_to_named_target(self, name: str) -> bool:
+        """
+        Move to a named pose using explicit joint values.
+        We send joint constraints directly because the raw action
+        client cannot resolve SRDF named states by string reference.
+        """
         self.get_logger().info(f'Moving to named target: [{name}]')
+
+        # Joint values for 'home' — all zeros
+        # Joint values for 'ready' — from SRDF definition
+        joint_positions = {
+            'home': [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            'ready': [0.0, -0.5, 0.5, 0.0, 0.0, 0.0],
+        }
+
+        if name not in joint_positions:
+            self.get_logger().error(f'Unknown named target: {name}')
+            return False
+
+        positions = joint_positions[name]
+        joint_names = [
+            'joint2_to_joint1',
+            'joint3_to_joint2',
+            'joint4_to_joint3',
+            'joint5_to_joint4',
+            'joint6_to_joint5',
+            'joint6output_to_joint6',
+        ]
+
+        from moveit_msgs.msg import JointConstraint
 
         goal_msg = MoveGroup.Goal()
         goal_msg.request.group_name = 'arm'
@@ -107,7 +128,21 @@ class PickAndPlaceNode(Node):
         goal_msg.request.allowed_planning_time = 5.0
         goal_msg.request.max_velocity_scaling_factor = 0.2
         goal_msg.request.max_acceleration_scaling_factor = 0.2
-        goal_msg.request.goal_constraints = [Constraints(name=name)]
+
+        # Build joint constraints — one per joint
+        joint_constraints = []
+        for joint_name, position in zip(joint_names, positions):
+            jc = JointConstraint()
+            jc.joint_name = joint_name
+            jc.position = position
+            jc.tolerance_above = 0.01  # 0.01 rad tolerance
+            jc.tolerance_below = 0.01
+            jc.weight = 1.0
+            joint_constraints.append(jc)
+
+        constraints = Constraints()
+        constraints.joint_constraints = joint_constraints
+        goal_msg.request.goal_constraints = [constraints]
 
         return self._send_goal_and_wait(goal_msg)
 
@@ -144,17 +179,17 @@ class PickAndPlaceNode(Node):
         self.get_logger().info('=' * 40)
 
         self.get_logger().info('\n--- Step 1/8: HOME ---')
-        if not self.move_to_named_target('home'):
+        if not self.move_to_joint_target('home'):
             self.get_logger().error('ABORT: Failed at HOME')
             return
 
         self.get_logger().info('\n--- Step 2/8: PRE-GRASP ---')
-        if not self.move_to_pose(self.poses['pre_grasp'], 'pre_grasp'):
+        if not self.move_to_joint_target('pre_grasp'):
             self.get_logger().error('ABORT: Failed at PRE-GRASP')
             return
 
         self.get_logger().info('\n--- Step 3/8: GRASP ---')
-        if not self.move_to_pose(self.poses['grasp'], 'grasp'):
+        if not self.move_to_joint_target('grasp'):
             self.get_logger().error('ABORT: Failed at GRASP')
             return
 
@@ -162,17 +197,17 @@ class PickAndPlaceNode(Node):
         self.simulate_gripper('close')
 
         self.get_logger().info('\n--- Step 5/8: LIFT ---')
-        if not self.move_to_pose(self.poses['lift'], 'lift'):
+        if not self.move_to_joint_target('lift'):
             self.get_logger().error('ABORT: Failed at LIFT')
             return
 
         self.get_logger().info('\n--- Step 6/8: PRE-PLACE ---')
-        if not self.move_to_pose(self.poses['pre_place'], 'pre_place'):
+        if not self.move_to_joint_target('pre_place'):
             self.get_logger().error('ABORT: Failed at PRE-PLACE')
             return
 
         self.get_logger().info('\n--- Step 7/8: PLACE ---')
-        if not self.move_to_pose(self.poses['place'], 'place'):
+        if not self.move_to_joint_target('place'):
             self.get_logger().error('ABORT: Failed at PLACE')
             return
 
@@ -180,7 +215,7 @@ class PickAndPlaceNode(Node):
         self.simulate_gripper('open')
 
         self.get_logger().info('\n--- Returning HOME ---')
-        self.move_to_named_target('home')
+        self.move_to_joint_target('home')
 
         self.get_logger().info('=' * 40)
         self.get_logger().info('SEQUENCE COMPLETE')
