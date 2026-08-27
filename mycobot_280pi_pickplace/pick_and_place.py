@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import rclpy
+import os, time
 from rclpy.node import Node
 from rclpy.action import ActionClient
 from geometry_msgs.msg import Pose, Point, Quaternion
@@ -29,12 +30,12 @@ class PickAndPlaceNode(Node):
         # [joint2_to_joint1, joint3_to_joint2, joint4_to_joint3,
         #  joint5_to_joint4, joint6_to_joint5, joint6output_to_joint6]
         self.joint_poses = {
-            'home':      [0.0,   0.0,   0.0,   0.0,   0.0,  0.0],
-            'pre_grasp': [1.431, 0.0,   0.0,   0.0,   0.0,  0.0],
-            'grasp':     [1.431, 0.0,   0.436, 0.0,   0.0,  0.0],
-            'lift':      [1.431, 0.0,   0.0,   0.0,   1.623, 0.0],
-            'pre_place': [1.431, 0.0,   0.0,   0.0,  -1.100, 0.0],
-            'place':     [-0.925, 0.0,  0.0,   0.0,   0.0,  0.0],
+        'home':      [ 0.000,  0.000,  0.000,  0.000,  0.000,  0.000],
+        'pre_grasp': [-1.675,  1.588,  0.698,  0.855,  0.000,  0.000],
+        'grasp':     [-1.536, -0.035,  0.698,  0.855,  0.000,  0.000],
+        'lift':      [-1.536,  0.646,  0.698,  0.279, -0.716, -0.209],
+        'pre_place': [ 1.571,  0.646,  0.698,  0.279, -0.716, -0.209],
+        'place':     [ 1.571,  1.484,  0.960,  0.593, -0.716, -0.209],
         }
 
         self.joint_names = [
@@ -52,6 +53,32 @@ class PickAndPlaceNode(Node):
             self.get_logger().error('MoveGroup action server not available!')
         else:
             self.get_logger().info('MoveGroup ready.')
+        
+        self.trigger_file = '/home/youniq/ros2ws/trigger.txt'
+        self.trigger_word = 'PICK'
+
+    def wait_for_trigger(self):
+        self.get_logger().info(
+            f'waiting for trigger word "{self.trigger_word}" in file: {self.trigger_file}'
+        )
+        if not os.path.exists(self.trigger_file):
+            with open(self.trigger_file, 'w') as f:
+                f.write('')  # create empty file if it doesn't exist
+            self.get_logger().info(f'Created trigger file: {self.trigger_file}')
+
+        while rclpy.ok():
+            try:
+                with open(self.trigger_file, 'r') as f:
+                    content = f.read().strip()
+                if self.trigger_word in content:
+                    self.get_logger().info(f'Trigger word "{self.trigger_word}" detected.')
+                    with open(self.trigger_file, 'w') as f:
+                        f.write('')  # clear the file after detecting trigger
+                    return True
+            except Exception as e:
+                self.get_logger().error(f'Error reading trigger file: {e}')
+                time.sleep(0.5)  # check every 0.5 seconds
+        return False  # if rclpy is not ok, exit the loop   
     def move_to_joint_target(self, pose_name: str) -> bool:
         """
         Move to a pose defined by joint angles.
@@ -174,6 +201,9 @@ class PickAndPlaceNode(Node):
         time.sleep(1.0)
 
     def execute_pick_and_place(self):
+        if not self.wait_for_trigger():
+            self.get_logger().error('Trigger wait interrupted.')
+            return  
         self.get_logger().info('=' * 40)
         self.get_logger().info('STARTING PICK AND PLACE SEQUENCE')
         self.get_logger().info('=' * 40)
