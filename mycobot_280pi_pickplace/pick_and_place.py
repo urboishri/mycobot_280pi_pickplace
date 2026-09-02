@@ -22,6 +22,11 @@ class PickAndPlaceNode(Node):
 
     def __init__(self):
         super().__init__('pick_and_place_node')
+        # self.declare_parameter('use_sim_time', True)
+        self.declare_parameter('trigger_file', '/home/youniq/ros2ws/trigger.txt')
+        self.declare_parameter('trigger_word', 'PICK')
+        self.trigger_file = self.get_parameter('trigger_file').value
+        self.trigger_word = self.get_parameter('trigger_word').value
         self.get_logger().info('Pick and Place Node has been started.')
 
         self._action_client = ActionClient(self, MoveGroup, '/move_action')
@@ -54,8 +59,6 @@ class PickAndPlaceNode(Node):
         else:
             self.get_logger().info('MoveGroup ready.')
         
-        self.trigger_file = '/home/youniq/ros2ws/trigger.txt'
-        self.trigger_word = 'PICK'
 
     def wait_for_trigger(self):
         self.get_logger().info(
